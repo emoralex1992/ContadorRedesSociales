@@ -9,15 +9,14 @@ from pymongo import MongoClient
 from datetime import datetime
 from config import MONGODB_PASSWORD, MONGODB_DB_NAME, MONGODB_USER, MONGODB_CLUSTER
 
-
 # Cuentas a seguir
-TIKTOK_USERS = ["engiacademy"]
+INSTAGRAM_USERS = ["engi_academy"]
 
 # MongoDB
 MONGO_URI = f"mongodb+srv://{MONGODB_USER}:{MONGODB_PASSWORD}@{MONGODB_CLUSTER}/?retryWrites=true&w=majority&appName=EngiAcademyCluster"
 client = MongoClient(MONGO_URI)
 db = client[MONGODB_DB_NAME]
-collection = db["tiktok_stats"]
+collection = db["instagram_stats"]
 
 def init_driver():
     chrome_options = Options()
@@ -33,13 +32,13 @@ def init_driver():
 def get_followers(username):
     try:
         driver = init_driver()
-        url = f"https://www.tiktok.com/@{username}"
+        url = f"https://www.instagram.com/{username}/"
         driver.get(url)
         time.sleep(10)
         source = driver.page_source
         driver.quit()
 
-        match = re.search(r'([\d,.]+)\s*seguidores', source, re.IGNORECASE)
+        match = re.search(r'([\d.,]+)\s*seguidores', source, re.IGNORECASE)
         if match:
             raw = match.group(1).replace('.', '').replace(',', '')
             return int(raw)
@@ -49,8 +48,8 @@ def get_followers(username):
 
 def update_followers():
     while True:
-        print(f"[{datetime.now().strftime('%H:%M:%S')}] Actualizando seguidores TikTok...")
-        for user in TIKTOK_USERS:
+        print(f"[{datetime.now().strftime('%H:%M:%S')}] Actualizando seguidores Instagram...")
+        for user in INSTAGRAM_USERS:
             count = get_followers(user)
             if count is not None:
                 collection.update_one(
