@@ -4,11 +4,14 @@
     <option name="autoReloadType" value="SELECTIVE" />
   </component>
   <component name="ChangeListManager">
-    <list default="true" id="4d6d07eb-01f4-4c2e-af94-4f64d1bb1432" name="Changes" comment="Primer commit">
-      <change afterPath="$PROJECT_DIR$/instagram_scraper.py" afterDir="false" />
+    <list default="true" id="4d6d07eb-01f4-4c2e-af94-4f64d1bb1432" name="Changes" comment="tik_tok_scraper.py y instagram_scraper.py funcionando individualmente.">
+      <change afterPath="$PROJECT_DIR$/register_user.py" afterDir="false" />
+      <change afterPath="$PROJECT_DIR$/server_stats.py" afterDir="false" />
+      <change afterPath="$PROJECT_DIR$/social_scraper.py" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/.gitignore" beforeDir="false" afterPath="$PROJECT_DIR$/.gitignore" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/tik_tok_scraper.py" beforeDir="false" afterPath="$PROJECT_DIR$/tik_tok_scraper.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/instagram_scraper.py" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/tik_tok_scraper.py" beforeDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
@@ -38,6 +41,9 @@
   &quot;keyToString&quot;: {
     &quot;Python.instagram_scraper.executor&quot;: &quot;Run&quot;,
     &quot;Python.main.executor&quot;: &quot;Run&quot;,
+    &quot;Python.register_user.executor&quot;: &quot;Run&quot;,
+    &quot;Python.server_stats.executor&quot;: &quot;Run&quot;,
+    &quot;Python.social_scraper.executor&quot;: &quot;Run&quot;,
     &quot;Python.tik_tok_scraper.executor&quot;: &quot;Run&quot;,
     &quot;RunOnceActivity.ShowReadmeOnStart&quot;: &quot;true&quot;
   }
@@ -90,11 +96,31 @@
       <option name="project" value="LOCAL" />
       <updated>1750226591311</updated>
     </task>
-    <option name="localTasksCounter" value="2" />
+    <task id="LOCAL-00002" summary="tik_tok_scraper.py y instagram_scraper.py funcionando individualmente.">
+      <option name="closed" value="true" />
+      <created>1750656208406</created>
+      <option name="number" value="00002" />
+      <option name="presentableId" value="LOCAL-00002" />
+      <option name="project" value="LOCAL" />
+      <updated>1750656208406</updated>
+    </task>
+    <option name="localTasksCounter" value="3" />
     <servers />
+  </component>
+  <component name="Vcs.Log.Tabs.Properties">
+    <option name="TAB_STATES">
+      <map>
+        <entry key="MAIN">
+          <value>
+            <State />
+          </value>
+        </entry>
+      </map>
+    </option>
   </component>
   <component name="VcsManagerConfiguration">
     <MESSAGE value="Primer commit" />
-    <option name="LAST_COMMIT_MESSAGE" value="Primer commit" />
+    <MESSAGE value="tik_tok_scraper.py y instagram_scraper.py funcionando individualmente." />
+    <option name="LAST_COMMIT_MESSAGE" value="tik_tok_scraper.py y instagram_scraper.py funcionando individualmente." />
   </component>
 </project>
