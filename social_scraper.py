@@ -1,212 +1,347 @@
-# ── social_scraper.py – 15-jul-2025 (v4.2) ─────────────────────────────
-import asyncio, re, time, certifi, requests, pathlib
+# social_scraper.py – 15‑jul‑2025 (robusto 24×7)
+"""
+Scraper de seguidores para TikTok, Instagram y YouTube basado en Playwright.
+
+Mejoras clave
+-------------
+*   **Sesión persistente de Instagram** → carpeta `ig_userdata` para no volver a
+    logarse salvo que la sesión caduque.
+*   **Reintentos exponenciales + jitter** en cualquier llamada con red/UI.
+*   **Paralelismo** configurable (`CONCURRENCY`) mediante semáforo.
+*   **Medición de tiempos** de cada cuenta y del ciclo completo.
+*   **Logs rotativos** en `./logs/scraper.log` y consola.
+*   **Compatibilidad Windows/Linux**: la captura de señales sólo se registra
+    cuando la plataforma lo soporta.
+
+Requisitos
+~~~~~~~~~~
+```bash
+python -m venv .venv && .venv\Scripts\activate      # Windows
+pip install -r requirements.txt
+playwright install chromium
+```
+Para congelar las dependencias instaladas:
+```bash
+pip freeze > requirements.txt
+```
+"""
+from __future__ import annotations
+
+import asyncio
+import contextlib
+import logging
+import logging.handlers
+import os
+import random
+import re
+import signal
+import sys
+import time
 from datetime import datetime, timezone
+from decimal import Decimal
+from pathlib import Path
+from typing import Any, Awaitable, Callable, List
+
+import certifi
+import requests
 from pymongo import MongoClient
-from playwright.async_api import async_playwright, TimeoutError, Error as PWError
-
-from config import (
-    MONGODB_USER, MONGODB_PASSWORD, MONGODB_CLUSTER, MONGODB_DB_NAME,
-    YOUTUBE_API_KEY, IG_USER, IG_PASS
+from playwright.async_api import (
+    BrowserContext,
+    Page,
+    TimeoutError,  # noqa: N811
+    async_playwright,
 )
 
-UA_STR           = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/125.0 Safari/537.36")
-IG_PREVIEW_USER  = "engi_academy"
-USER_DATA_DIR    = "ig_session"
-pathlib.Path(USER_DATA_DIR).mkdir(exist_ok=True)
+# ──────────────────────────  Config  ──────────────────────────
+try:
+    import importlib
 
-# ─────────── Mongo ───────────
-mongo = MongoClient(
-    f"mongodb+srv://{MONGODB_USER}:{MONGODB_PASSWORD}@{MONGODB_CLUSTER}"
-    "/?retryWrites=true&w=majority",
-    tls=True, tlsCAFile=certifi.where()
+    _cfg = importlib.import_module("config")
+except ModuleNotFoundError as exc:
+    raise SystemExit(f"⚠️  No se pudo importar config.py: {exc}") from exc
+
+#  Credenciales obligatorias que ya existen en tu config.py
+MONGODB_USER: str = _cfg.MONGODB_USER
+MONGODB_PASSWORD: str = _cfg.MONGODB_PASSWORD
+MONGODB_CLUSTER: str = _cfg.MONGODB_CLUSTER
+MONGODB_DB_NAME: str = _cfg.MONGODB_DB_NAME
+IG_USER: str = _cfg.IG_USER
+IG_PASS: str = _cfg.IG_PASS
+YOUTUBE_API_KEY: str = _cfg.YOUTUBE_API_KEY
+
+#  Parámetros opcionales con valores por defecto
+HEADLESS: bool = bool(getattr(_cfg, "HEADLESS", True))
+CONCURRENCY: int = int(getattr(_cfg, "CONCURRENCY", 4))
+RETRIES: int = int(getattr(_cfg, "RETRIES", 3))
+LOOP_EVERY: int = int(getattr(_cfg, "LOOP_EVERY", 60))  # segundos entre ciclos
+
+MONGODB_URI: str = getattr(
+    _cfg,
+    "MONGODB_URI",
+    f"mongodb+srv://{MONGODB_USER}:{MONGODB_PASSWORD}@{MONGODB_CLUSTER}/?retryWrites=true&w=majority",
 )
-COL = mongo[MONGODB_DB_NAME]["social_accounts"]
 
-# ─────────── helpers ───────────
+# ─────────────────────────  Logging  ─────────────────────────
+LOG_DIR = Path.cwd() / "logs"
+LOG_DIR.mkdir(exist_ok=True)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)-8s | %(message)s",
+    datefmt="%H:%M:%S",
+    handlers=[
+        logging.StreamHandler(sys.stdout),
+        logging.handlers.RotatingFileHandler(
+            LOG_DIR / "scraper.log", maxBytes=1 << 20, backupCount=5, encoding="utf-8"
+        ),
+    ],
+)
+logger = logging.getLogger("scraper")
+
+# ─────────────────────────  Helpers  ─────────────────────────
+UA_STR = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
+)
+HEADERS = {"User-Agent": UA_STR, "Cache-Control": "no-cache"}
+
+_DIGIT_RE = re.compile(r"([\d.,]+)\s*([kmb]?)", re.I)
+_SUFFIX: dict[str, Decimal] = {
+    "": Decimal(1),
+    "k": Decimal(1_000),
+    "m": Decimal(1_000_000),
+    "b": Decimal(1_000_000_000),
+}
+
 def digits(txt: str) -> int | None:
-    txt = txt.replace("\u202f", " ")
-    m = re.search(r"([\d\.,]+)", txt)
-    return None if not m else int(float(m.group(1).replace(".", "").replace(",", ".")))
-
-async def accept_cookies(page):
-    for lbl in ("Aceptar todas", "Allow essential and optional cookies",
-                "Permitir todas las cookies", "Accept all"):
-        btn = page.locator(f"button:has-text('{lbl}')")
-        if await btn.is_visible():
-            await btn.click()
-            print("   🍪  Cookies aceptadas")
-            break
-
-# ─────────── Instagram ───────────
-async def ig_do_login(page):
-    await accept_cookies(page)
-    if not await page.locator('input[name="username"]').is_visible():
-        return
-    print("   🔑  Rellenando credenciales IG…")
-    await page.fill('input[name="username"]', IG_USER)
-    await page.fill('input[name="password"]', IG_PASS)
-    await page.click('button[type="submit"]')
-    try:
-        await page.wait_for_selector('nav[role="navigation"]', timeout=20_000)
-        print("   ✅  Login completado")
-    except TimeoutError:
-        print("   ⚠️  Timeout tras enviar credenciales")
-
-async def ig_ensure_logged(page):
-    if page.url.startswith("https://www.instagram.com/accounts/login"):
-        await ig_do_login(page)
-
-async def ig_followers(page, user: str, retries=3) -> int | None:
-    profile_url = f"https://www.instagram.com/{user}/"
-    for n in range(1, retries + 1):
-        try:
-            await page.goto(profile_url, timeout=0)
-            await page.wait_for_load_state('domcontentloaded')
-        except PWError:
-            pass
-        await ig_ensure_logged(page)
-        await accept_cookies(page)
-
-        if await page.locator("text=Hay un problema").is_visible():
-            print(f"⟳  Reintento {n}/{retries} – página con error")
-            btn = page.locator("text=Volver a cargar la página")
-            if await btn.is_visible():
-                await btn.click()
-            else:
-                await page.reload()
-            continue
-
-        span = page.locator('a[href$="followers/"] span[title]').first
-        try:
-            await span.wait_for(state="visible", timeout=10_000)
-            raw = await span.get_attribute("title")
-            return digits(raw)
-        except TimeoutError:
-            print(f"⟳  Reintento {n}/{retries} – followers no visibles")
-            await page.reload()
-    return None
-
-async def open_visible_profile(play):
-    print(f"👀  Abriendo ventana visible con el perfil @{IG_PREVIEW_USER}…")
-    ctx = await play.chromium.launch_persistent_context(
-        USER_DATA_DIR,
-        headless=False,
-        viewport={"width": 1280, "height": 900},
-        user_agent=UA_STR,
-        args=["--lang=en-US,en", "--disable-blink-features=AutomationControlled"],
-    )
-    pg = await ctx.new_page()
-    await ig_ensure_logged(pg)
-    ok = await ig_followers(pg, IG_PREVIEW_USER)
-    if ok is not None:
-        print(f"✅  Perfil visible cargado (followers = {ok})")
-    else:
-        print("❌  No se pudo dejar el perfil operativo; de todos modos continúa.")
-    print("🪟  Deja esta ventana abierta; el loop corre en segundo plano.\n")
-    return ctx, pg
-
-# ─────────── TikTok ───────────
-def tk_html(user):
-    try:
-        html = requests.get(f"https://www.tiktok.com/@{user}",
-                            headers={"User-Agent": UA_STR, "Cache-Control": "no-cache"},
-                            timeout=10).text
-        m = re.search(r'data-e2e="followers-count"[^>]*>([^<]+)<', html)
-        if m:
-            return digits(m.group(1))
-        m = re.search(r'"followerCount":\s*(\d+)', html)
-        return int(m.group(1)) if m else None
-    except Exception:
+    """Convierte «1.2M», «30 seguidores» → int."""
+    txt = txt.replace("\u202f", " ").lower()
+    m = _DIGIT_RE.search(txt)
+    if not m:
         return None
+    num_text = m.group(1).replace(".", "").replace(",", ".")
+    num = Decimal(num_text)
+    factor = _SUFFIX[m.group(2)]
+    return int(num * factor)
 
-async def tk_pw(page, user):
-    try:
-        await page.goto(f"https://www.tiktok.com/@{user}", timeout=0)
-        await page.wait_for_selector('[data-e2e="followers-count"]', timeout=10_000)
-        txt = await page.locator('[data-e2e="followers-count"]').inner_text()
-        return digits(txt)
-    except Exception:
-        return None
 
-# ─────────── YouTube ───────────
-YT_S = ("https://www.googleapis.com/youtube/v3/search?"
-        "part=snippet&type=channel&q={h}&key={k}")
-YT_C = ("https://www.googleapis.com/youtube/v3/channels?"
-        "part=statistics&id={cid}&key={k}")
+def retry_async(times: int = 3, base: float = 1.6):
+    """Decorador de reintentos exponenciales + jitter."""
 
-def yt_channel(handle):
-    try:
-        return requests.get(YT_S.format(h=handle, k=YOUTUBE_API_KEY), timeout=10)\
-                       .json()["items"][0]["snippet"]["channelId"]
-    except Exception:
-        return None
+    def decorator(fn: Callable[..., Awaitable[Any]]):
+        async def wrapper(*args, **kwargs):  # type: ignore[override]
+            for attempt in range(1, times + 1):
+                try:
+                    return await fn(*args, **kwargs)
+                except Exception as exc:  # noqa: BLE001
+                    if attempt == times:
+                        logger.error("❌ %s agotó %s intentos – %s", fn.__name__, times, exc)
+                        return None
+                    wait = base ** attempt + random.uniform(0, 1)
+                    logger.warning(
+                        "⟳ Reintento %s/%s %s en %.1fs (%s)", attempt, times, fn.__name__, wait, exc
+                    )
+                    await asyncio.sleep(wait)
 
-def yt_subs(cid):
-    try:
-        return int(requests.get(YT_C.format(cid=cid, k=YOUTUBE_API_KEY), timeout=10)
-                   .json()["items"][0]["statistics"]["subscriberCount"])
-    except Exception:
-        return None
+        return wrapper
 
-# ─────────── loop principal ───────────
-async def main_loop():
+    return decorator
+
+
+# ──────────────────────────  Mongo  ─────────────────────────
+client = MongoClient(MONGODB_URI, tlsCAFile=certifi.where())
+COL = client[MONGODB_DB_NAME]["social_accounts"]
+
+# ───────────────────────── TikTok ──────────────────────────
+@retry_async(times=RETRIES)
+async def _tk_html(user: str) -> int | None:
+    html = requests.get(f"https://www.tiktok.com/@{user}", headers=HEADERS, timeout=10).text
+    m = re.search(r'data-e2e="followers-count"[^>]*>([^<]+)<', html)
+    if m:
+        return digits(m.group(1))
+    m = re.search(r'"followerCount":\s*(\d+)', html)
+    return int(m.group(1)) if m else None
+
+
+@retry_async(times=RETRIES)
+async def _tk_api(user: str) -> int | None:
+    url = f"https://www.tiktok.com/api/user/detail/?uniqueId={user}"
+    j = requests.get(url, headers=HEADERS, timeout=10).json()
+    return j.get("userInfo", {}).get("stats", {}).get("followerCount")
+
+
+async def tiktok_followers(user: str) -> int | None:
+    return await _tk_html(user) or await _tk_api(user)
+
+
+# ───────────────────────── YouTube ─────────────────────────
+YT_S = (
+    "https://www.googleapis.com/youtube/v3/search?part=snippet&type=channel&q={h}&key="
+    + YOUTUBE_API_KEY
+)
+YT_C = (
+    "https://www.googleapis.com/youtube/v3/channels?part=statistics&id={cid}&key="
+    + YOUTUBE_API_KEY
+)
+
+
+@retry_async(times=RETRIES)
+async def yt_channel_id(handle: str) -> str | None:
+    j = requests.get(YT_S.format(h=handle), timeout=10).json()
+    items = j.get("items")
+    return items[0]["snippet"]["channelId"] if items else None
+
+
+@retry_async(times=RETRIES)
+async def yt_subscribers(cid: str) -> int | None:
+    j = requests.get(YT_C.format(cid=cid), timeout=10).json()
+    items = j.get("items")
+    return int(items[0]["statistics"]["subscriberCount"]) if items else None
+
+
+# ───────────────────── Instagram (Playwright) ───────────────────
+USER_DATA = Path.cwd() / "ig_userdata"
+FOLLOWERS_LOC = "a[href$='followers/'] span[title]"
+
+
+async def _accept_cookies(page: Page) -> None:
+    with contextlib.suppress(TimeoutError):
+        await page.locator("text=/^(Aceptar todas|Accept all)/i").click(timeout=5_000)
+        logger.debug("🍪 Cookies aceptadas")
+
+
+async def _login_if_needed(page: Page) -> None:
+    if await page.is_visible("input[name='username']"):
+        logger.info("🔑 Rellenando credenciales IG…")
+        await page.fill("input[name='username']", IG_USER)
+        await page.fill("input[name='password']", IG_PASS)
+        await page.press("input[name='password']", "Enter")
+        with contextlib.suppress(TimeoutError):
+            await page.wait_for_selector("text=/Guardar información|Save info/i", timeout=15_000)
+            await page.click("text=/Ahora no|Not now/i", timeout=5_000)
+
+
+def _ig_retry(fn: Callable[..., Awaitable[Any]]):
+    """Retry específico para acciones del browser con cierre de página"""
+
+    async def wrapper(page: Page, *args, **kwargs):  # type: ignore[override]
+        for attempt in range(1, RETRIES + 1):
+            try:
+                return await fn(page, *args, **kwargs)
+            except Exception as exc:  # noqa: BLE001
+                if attempt == RETRIES:
+                    logger.error("❌ IG agotó %s intentos – %s", RETRIES, exc)
+                    return None
+                wait = 1.4 ** attempt + random.uniform(0, 1)
+                logger.warning("⟳ IG retry %s/%s en %.1fs (%s)", attempt, RETRIES, wait, exc)
+                await asyncio.sleep(wait)
+
+    return wrapper
+
+
+@_ig_retry
+async def _ensure_profile(page: Page, user: str) -> None:
+    await page.goto(f"https://www.instagram.com/{user}/", timeout=0)
+    await _accept_cookies(page)
+    await _login_if_needed(page)
+    await page.wait_for_selector(FOLLOWERS_LOC, timeout=15_000)
+
+
+@_ig_retry
+async def instagram_followers(page: Page, user: str) -> int | None:
+    await _ensure_profile(page, user)
+    txt = await page.locator(FOLLOWERS_LOC).inner_text()
+    return digits(txt)
+
+
+# ─────────────────────────── Main Loop ───────────────────────────
+async def gather_followers(ctx: BrowserContext, doc: dict) -> None:
+    """Procesa una sola cuenta de Mongo y actualiza sus stats."""
+    start = time.perf_counter()
+    upd: dict[str, Any] = {}
+    log_parts: List[str] = []
+
+    email = doc.get("email", "sin_email")
+
+    # TikTok
+    if tk := doc.get("tiktok_id"):
+        tk_followers = await tiktok_followers(tk)
+        upd["tiktok_stats"] = {
+            "followers": tk_followers,
+            "updated_at": datetime.now(timezone.utc),
+        }
+        log_parts.append(f"TikTok:@{tk} → {tk_followers}")
+
+    # Instagram (necesita página)
+    if ig := doc.get("instagram_id"):
+        page = await ctx.new_page()
+        ig_followers = await instagram_followers(page, ig)
+        await page.close()
+        upd["instagram_stats"] = {
+            "followers": ig_followers,
+            "updated_at": datetime.now(timezone.utc),
+        }
+        log_parts.append(f"Instagram:@{ig} → {ig_followers}")
+
+    # YouTube
+    if yh := doc.get("youtube_id"):
+        cid = doc.get("youtube_channel_id") or await yt_channel_id(yh)
+        subs = await yt_subscribers(cid) if cid else None
+        if subs is not None:
+            upd["youtube_channel_id"] = cid
+            upd["youtube_stats"] = {
+                "subscribers": subs,
+                "updated_at": datetime.now(timezone.utc),
+            }
+        log_parts.append(f"YouTube:@{yh} → {subs}")
+
+    upd["last_updated"] = datetime.now(timezone.utc)
+    COL.update_one({"_id": doc["_id"]}, {"$set": upd})
+
+    elapsed = time.perf_counter() - start
+    logger.info("✅ %s actualizado en %.2fs | %s", email, elapsed, " | ".join(log_parts))
+
+
+async def main() -> None:
     async with async_playwright() as pw:
-        vis_ctx, _ = await open_visible_profile(pw)
-        ig_page = await vis_ctx.new_page()
+        ig_ctx = await pw.chromium.launch_persistent_context(
+            USER_DATA,
+            headless=HEADLESS,
+            locale="en-US",
+            user_agent=UA_STR,
+            args=["--lang=en-US,en"],
+        )
 
-        tk_br  = await pw.chromium.launch(headless=True)
-        tk_ctx = await tk_br.new_context(user_agent=UA_STR)
-        tk_pg  = await tk_ctx.new_page()
+        # Registro de señales (solo en plataformas que lo soporten)
+        try:
+            loop = asyncio.get_running_loop()
+            for sig in (signal.SIGINT, signal.SIGTERM):
+                loop.add_signal_handler(sig, lambda sig=sig: asyncio.create_task(ig_ctx.close()))
+        except NotImplementedError:
+            pass
+
+        sem = asyncio.Semaphore(CONCURRENCY)
 
         while True:
-            loop_start = time.time()
-            print(f"[{datetime.now():%H:%M:%S}] ⏳  Actualizando…")
+            cycle_start = time.perf_counter()
+            tasks = []
 
-            for doc in COL.find({"verified": True}):
-                t_acc = time.time()
-                upd, log = {}, []
-                email = doc.get("email", "sin_email")
+            async def worker(document: dict) -> None:
+                async with sem:
+                    await gather_followers(ig_ctx, document)
 
-                # TikTok
-                if tk := doc.get("tiktok_id"):
-                    f = tk_html(tk) or await tk_pw(tk_pg, tk)
-                    upd["tiktok_stats"] = {"followers": f,
-                                           "updated_at": datetime.now(timezone.utc)}
-                    log.append(f"• TikTok  @{tk:<20} {f}")
+            for document in COL.find({"verified": True}):
+                tasks.append(asyncio.create_task(worker(document)))
 
-                # Instagram
-                if ig := doc.get("instagram_id"):
-                    f = await ig_followers(ig_page, ig)
-                    upd["instagram_stats"] = {"followers": f,
-                                              "updated_at": datetime.now(timezone.utc)}
-                    log.append(f"• Instagram @{ig:<20} {f}")
+            await asyncio.gather(*tasks)
+            cycle_elapsed = time.perf_counter() - cycle_start
+            logger.info(
+                "🔄 Ciclo completo en %.2fs – próxima pasada en %ss", cycle_elapsed, LOOP_EVERY
+            )
+            await asyncio.sleep(max(0, LOOP_EVERY - cycle_elapsed))
 
-                # YouTube
-                if yh := doc.get("youtube_id"):
-                    cid  = doc.get("youtube_channel_id") or yt_channel(yh)
-                    subs = yt_subs(cid) if cid else None
-                    if subs is not None:
-                        upd["youtube_channel_id"] = cid
-                        upd["youtube_stats"] = {"subscribers": subs,
-                                                "updated_at": datetime.now(timezone.utc)}
-                    log.append(f"• YouTube  {yh:<22} {subs}")
-
-                upd["last_updated"] = datetime.now(timezone.utc)
-                COL.update_one({"_id": doc["_id"]}, {"$set": upd})
-
-                print(f"   ✅ {email} actualizado "
-                      f"⏱ {time.time() - t_acc:.2f}s")
-                for l in log:
-                    print("      " + l)
-                print()
-
-            cycle = time.time() - loop_start
-            wait  = max(0, 60 - cycle)
-            print(f"⏳  Siguiente pase en {wait:.1f}s "
-                  f"(ciclo: {cycle:.2f}s)\n")
-            await asyncio.sleep(wait)
 
 if __name__ == "__main__":
-    asyncio.run(main_loop())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logger.info("🛑 Interrumpido por el usuario")
