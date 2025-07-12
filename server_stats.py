@@ -1,52 +1,75 @@
-"""
-Levanta un servidor HTTP que devuelve, en JSON, los stats guardados en MongoDB
-para el usuario cuyo `email` se pasa como query-string.
+#!/usr/bin/env python3
+# server_stats.py — versión completa actualizada 11-jul-2025 (usa config.py)
 
-GET /api/stats?email=test@gmail.com
+"""
+Servidor HTTP que devuelve en JSON las estadísticas de redes sociales
+almacenadas en MongoDB para el usuario cuyo `email` se pasa como query-string.
+
+Endpoints:
+  GET /             → página de bienvenida
+  GET /api/stats    → stats JSON, requiere ?email=tu_email
 
 Requisitos:
-    pip install flask pymongo python-dotenv
-    # (.env con credenciales o usa config.py)
+    pip install flask pymongo certifi
 """
 
-import os, json
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, abort
 from pymongo import MongoClient
-from bson import json_util
-from dotenv import load_dotenv
-import config  # contiene MONGODB_USER, MONGODB_PASSWORD, ...
-
-load_dotenv()  # opcional, si prefieres variables de entorno
-
-# --- MongoDB -------------------------------------------------------------
-URI = (
-    f"mongodb+srv://{config.MONGODB_USER}:{config.MONGODB_PASSWORD}"
-    f"@{config.MONGODB_CLUSTER}/?retryWrites=true&w=majority"
+import certifi
+from config import (
+    MONGODB_USER,
+    MONGODB_PASSWORD,
+    MONGODB_CLUSTER,
+    MONGODB_DB_NAME
 )
-COL = MongoClient(URI)[config.MONGODB_DB_NAME]["social_accounts"]
 
-# --- Flask ---------------------------------------------------------------
+# Verificar que config.py tenga todas las credenciales
+if not all([MONGODB_USER, MONGODB_PASSWORD, MONGODB_CLUSTER, MONGODB_DB_NAME]):
+    raise RuntimeError("Revisa config.py: faltan credenciales de MongoDB")
+
+# Construir URI de conexión
+MONGO_URI = (
+    f"mongodb+srv://{MONGODB_USER}:{MONGODB_PASSWORD}"
+    f"@{MONGODB_CLUSTER}/?retryWrites=true&w=majority"
+)
+
+# Cliente Mongo con verificación TLS usando el bundle de certifi
+client = MongoClient(
+    MONGO_URI,
+    tls=True,
+    tlsCAFile=certifi.where()
+)
+COL = client[MONGODB_DB_NAME]["social_accounts"]
+
 app = Flask(__name__)
-
-@app.route("/api/stats")
-def stats():
-    email = request.args.get("email")
-    if not email:
-        return jsonify({"error": "email parameter is required"}), 400
-
-    doc = COL.find_one({"email": email, "verified": True})
-    if not doc:
-        return jsonify({"error": "user not found"}), 404
-
-    # Convertir ObjectId y fechas BSON → JSON serializable
-    return app.response_class(
-        json.dumps(doc, default=json_util.default),
-        mimetype="application/json"
-    )
 
 @app.route("/")
 def index():
-    return "Social Stats API — use /api/stats?email=<user>", 200
+    return (
+        "<h1>Social Stats API</h1>"
+        "<p>Usa <code>/api/stats?email=tu_email</code> para obtener datos JSON.</p>"
+    ), 200
+
+@app.route("/api/stats", methods=["GET"])
+def stats():
+    email = request.args.get("email")
+    if not email:
+        abort(400, description="Falta el parámetro 'email'")
+    # Solo cuentas verificadas
+    doc = COL.find_one({"email": email, "verified": True})
+    if not doc:
+        abort(404, description="Cuenta no encontrada o no verificada")
+
+    # Preparar solo los campos públicos
+    resultado = {
+        "email":        doc["email"],
+        "tiktok":       doc.get("tiktok_stats",    {}),
+        "instagram":    doc.get("instagram_stats", {}),
+        "youtube":      doc.get("youtube_stats",   {}),
+        "last_updated": doc.get("last_updated")
+    }
+    return jsonify(resultado)
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000, debug=False)
+    # En producción reemplaza el servidor dev con Gunicorn/Waitress
+    app.run(host="0.0.0.0", port=80, debug=False)
